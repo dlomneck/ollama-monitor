@@ -1398,7 +1398,7 @@ struct AboutView: View {
                 .font(.title2)
                 .bold()
 
-            Text("Version 0.19")
+            Text("Version 0.20")
                 .foregroundStyle(.secondary)
 
             Text("David Lomneck")
