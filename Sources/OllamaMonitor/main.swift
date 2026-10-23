@@ -1054,7 +1054,7 @@ struct ContentView: View {
             }
 
             Divider()
-                .padding(.vertical, 10)
+                .padding(.vertical, 8)
 
             // Model
             VStack(alignment: .leading, spacing: 5) {
@@ -1103,7 +1103,7 @@ struct ContentView: View {
             }
 
             Divider()
-                .padding(.vertical, 10)
+                .padding(.vertical, 8)
 
             // Activity
             VStack(alignment: .leading, spacing: 7) {
@@ -1164,7 +1164,7 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                         Text(monitor.state == "PROCESSING"
                              ? monitor.promptTokens : monitor.generationTokens)
-                            .font(.system(size: 16, weight: .medium, design: .monospaced))
+                        .font(.system(size: 14, weight: .medium, design: .monospaced))
                     }
 
                     VStack(alignment: .leading, spacing: 3) {
@@ -1173,7 +1173,7 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                         Text(monitor.state == "PROCESSING"
                              ? monitor.promptSpeed : monitor.generationSpeed)
-                            .font(.system(size: 16, weight: .medium, design: .monospaced))
+                        .font(.system(size: 14, weight: .medium, design: .monospaced))
                     }
 
                     Spacer(minLength: 0)
@@ -1183,14 +1183,14 @@ struct ContentView: View {
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                         Text(monitor.elapsed)
-                            .font(.system(size: 16, weight: .medium, design: .monospaced))
+                            .font(.system(size: 14, weight: .medium, design: .monospaced))
                             .lineLimit(1)
                             .minimumScaleFactor(0.75)
                     }
                 }
             }
 
-            Divider().padding(.vertical, 10)
+            Divider().padding(.vertical, 8)
 
             // System Performance
             Button {
@@ -1308,18 +1308,18 @@ struct ContentView: View {
                 .transition(.opacity.combined(with: .move(edge: .top)))
             }
 
-            Divider().padding(.vertical, 10)
+            Divider().padding(.vertical, 8)
 
             // Controls
             // Controls
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 6) {
 
                 Text("OLLAMA")
                     .font(.caption)
                     .bold()
                     .foregroundStyle(.secondary)
 
-                HStack(spacing: 8) {
+                HStack(spacing: 6) {
 
                     Button {
                         monitor.startOllama()
@@ -1329,6 +1329,7 @@ struct ContentView: View {
                             "Start",
                             systemImage: "play.fill"
                         )
+                        .font(.caption)
                         .frame(
                             maxWidth: .infinity
                         )
@@ -1348,6 +1349,7 @@ struct ContentView: View {
                             "Stop",
                             systemImage: "stop.fill"
                         )
+                        .font(.caption)
                         .frame(
                             maxWidth: .infinity
                         )
@@ -1367,6 +1369,7 @@ struct ContentView: View {
                             "Restart",
                             systemImage: "arrow.clockwise"
                         )
+                        .font(.caption)
                         .frame(
                             maxWidth: .infinity
                         )
@@ -1377,6 +1380,7 @@ struct ContentView: View {
                         monitor.isBusy || !monitor.unloadingModels.isEmpty
                     )
                 }
+                .controlSize(.small)
 
                 if !monitor.controlMessage.isEmpty {
                     Text(monitor.controlMessage)
@@ -1429,8 +1433,8 @@ struct ContentView: View {
                 }
             }
         }
-        .padding(16)
-        .frame(width: 420)
+        .padding(14)
+        .frame(width: 380)
         .fixedSize(horizontal: false, vertical: true)
         .background(
             GeometryReader { geometry in
@@ -1552,7 +1556,7 @@ struct AboutView: View {
                 .font(.title2)
                 .bold()
 
-            Text("Version 0.27")
+            Text("Version 0.28")
                 .foregroundStyle(.secondary)
 
             Text("David Lomneck")
@@ -1673,7 +1677,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             panel = NSPanel(
                 contentRect: NSRect(
-                    x: 0, y: 0, width: 420, height: 800
+                    x: 0, y: 0, width: 380, height: 800
                 ),
                 styleMask: [.titled, .closable, .utilityWindow],
                 backing: .buffered,
@@ -1700,7 +1704,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
 
                     let oldFrame = panel.frame
-                    let newSize = NSSize(width: 420, height: height)
+                    let newSize = NSSize(width: 380, height: height)
                     let heightDelta = newSize.height - oldFrame.size.height
 
                     var newFrame = oldFrame
