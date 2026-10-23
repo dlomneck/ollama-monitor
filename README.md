@@ -61,4 +61,4 @@ There are no prebuilt downloads yet. For now, build from source using the instru
 
 ## License
 
-A license has not been added yet.
+Released under the [MIT License](LICENSE).
