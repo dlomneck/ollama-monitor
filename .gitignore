@@ -1,0 +1,14 @@
+# macOS clutter
+.DS_Store
+
+# Swift build artifacts
+.build/
+
+# Built application
+OllamaMonitor.app/
+
+# Generated icon files
+OllamaMonitor.iconset/
+
+# Historical backups are retained locally
+backups/

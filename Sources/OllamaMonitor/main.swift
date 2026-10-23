@@ -1,0 +1,1618 @@
+import SwiftUI
+import Foundation
+import AppKit
+
+// MARK: - Ollama API
+
+struct OllamaResponse: Decodable {
+    let models: [OllamaModel]
+}
+
+struct OllamaModel: Decodable {
+    let name: String
+    let size: Int64
+    let sizeVRAM: Int64
+    let contextLength: Int
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case size
+        case sizeVRAM = "size_vram"
+        case contextLength = "context_length"
+    }
+}
+
+
+// MARK: - Persistent Settings
+
+struct MonitorSettingsData: Codable {
+    var serverURL = "http://127.0.0.1:11434"
+    var logPath = "~/.ollama/logs/server.log"
+    var appPath = "Ollama"
+    var refreshInterval = 0.5
+}
+
+@MainActor
+final class AppSettings: ObservableObject {
+    static let shared = AppSettings()
+
+    @Published var serverURL: String { didSet { save() } }
+    @Published var logPath: String { didSet { save() } }
+    @Published var appPath: String { didSet { save() } }
+    @Published var refreshInterval: Double { didSet { save() } }
+
+    private static var configURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(
+                "Library/Application Support/OllamaMonitor",
+                isDirectory: true
+            )
+            .appendingPathComponent("config.json")
+    }
+
+    private init() {
+        var data = MonitorSettingsData()
+
+        if let file = try? Data(contentsOf: Self.configURL),
+           let saved = try? JSONDecoder().decode(
+               MonitorSettingsData.self, from: file
+           ) {
+            data = saved
+        }
+
+        serverURL = data.serverURL
+        logPath = data.logPath
+        appPath = data.appPath
+        refreshInterval = [0.5, 1, 2, 3, 5].contains(data.refreshInterval)
+            ? data.refreshInterval : 0.5
+    }
+
+    var expandedLogURL: URL {
+        URL(fileURLWithPath:
+            (logPath as NSString).expandingTildeInPath
+        )
+    }
+
+    var appDisplayName: String {
+        let value = appPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return "Ollama" }
+        return URL(fileURLWithPath: value)
+            .deletingPathExtension().lastPathComponent
+    }
+
+    func restoreDefaults() {
+        serverURL = "http://127.0.0.1:11434"
+        logPath = "~/.ollama/logs/server.log"
+        appPath = "Ollama"
+        refreshInterval = 0.5
+    }
+
+    private func save() {
+        let data = MonitorSettingsData(
+            serverURL: serverURL,
+            logPath: logPath,
+            appPath: appPath,
+            refreshInterval: refreshInterval
+        )
+
+        do {
+            let directory = Self.configURL.deletingLastPathComponent()
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true
+            )
+            let encoded = try JSONEncoder().encode(data)
+            try encoded.write(to: Self.configURL, options: .atomic)
+        } catch {
+            NSLog("Ollama Monitor: Could not save settings: %@", error.localizedDescription)
+        }
+    }
+}
+
+// MARK: - Monitor
+
+@MainActor
+final class Monitor: ObservableObject {
+
+    // Connection
+    @Published var ollamaOnline = false
+    @Published var isBusy = false
+
+    // Model
+    @Published var modelName = "-"
+    @Published var modelSize = "-"
+    @Published var processor = "-"
+    @Published var context = "-"
+
+    // Activity
+    @Published var state = "IDLE"
+    @Published var activity = "No active generation"
+    @Published var elapsed = "-"
+
+    // Prompt
+    @Published var promptTokens = "-"
+    @Published var promptSpeed = "-"
+    @Published var promptProgress: Double = 0
+
+    // Generation
+    @Published var generationTokens = "-"
+    @Published var generationSpeed = "-"
+
+    // Last activity
+    @Published var lastActivity = "Waiting for Ollama..."
+
+    // System metrics
+    @Published var systemCPU: Double = 0
+    @Published var ollamaCPU: Double = 0
+    @Published var memoryUsedGB: Double = 0
+    @Published var memoryAvailableGB: Double = 0
+    @Published var memoryTotalGB: Double = 0
+    @Published var swapUsedGB: Double = 0
+    @Published var swapTotalGB: Double = 0
+    private var metricsInFlight = false
+    private var lastMetricsPoll = Date.distantPast
+
+    private var timer: Timer?
+    private var logOffset: UInt64 = 0
+    private var logFileIdentity: String?
+    private var requestStart: Date?
+    private var lastRequestLogAt: Date?
+    private var lastPoll = Date.distantPast
+
+    private var logPath: URL {
+        AppSettings.shared.expandedLogURL
+    }
+
+    init() {
+        loadInitialLog()
+
+        timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) {
+            [weak self] _ in
+            Task { @MainActor in
+                self?.scheduledPoll()
+            }
+        }
+
+        poll()
+    }
+
+    deinit {
+        timer?.invalidate()
+    }
+
+    // MARK: - Poll
+
+    private func refreshSystemMetrics() {
+        guard !metricsInFlight else { return }
+        metricsInFlight = true
+
+        DispatchQueue.global(qos: .utility).async {
+            func run(_ path: String, _ args: [String]) -> String {
+                let process = Process()
+                let pipe = Pipe()
+                process.executableURL = URL(fileURLWithPath: path)
+                process.arguments = args
+                process.standardOutput = pipe
+                process.standardError = FileHandle.nullDevice
+                do {
+                    try process.run()
+                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                    process.waitUntilExit()
+                    return String(data: data, encoding: .utf8) ?? ""
+                } catch {
+                    return ""
+                }
+            }
+
+            let top = run("/usr/bin/top", ["-l", "1", "-n", "0"])
+            var cpu = 0.0
+            if let line = top.components(separatedBy: .newlines)
+                .first(where: { $0.contains("CPU usage:") }),
+               let range = line.range(of: #"([0-9.]+)% idle"#,
+                                      options: .regularExpression) {
+                let idleText = line[range]
+                    .replacingOccurrences(of: "% idle", with: "")
+                cpu = max(0, min(100, 100 - (Double(idleText) ?? 100)))
+            }
+
+            let ps = run("/bin/ps", ["-A", "-o", "%cpu=,comm="])
+            let ollamaCPU = ps.components(separatedBy: .newlines).compactMap { line -> Double? in
+                let lower = line.lowercased()
+                guard lower.contains("ollama") || lower.contains("llama-server")
+                    || lower.contains("llama.cpp") else { return nil }
+                return Double(line.trimmingCharacters(in: .whitespaces).split(separator: " ").first ?? "")
+            }.reduce(0, +)
+
+            let total = Double(run("/usr/sbin/sysctl", ["-n", "hw.memsize"])
+                .trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+            let page = Double(run("/usr/sbin/sysctl", ["-n", "hw.pagesize"])
+                .trimmingCharacters(in: .whitespacesAndNewlines)) ?? 4096
+            let vm = run("/usr/bin/vm_stat", [])
+            func pages(_ label: String) -> Double {
+                guard let range = vm.range(of: label) else { return 0 }
+                let tail = vm[range.upperBound...]
+                return Double(tail.prefix(while: { $0.isNumber })) ?? 0
+            }
+            let available = (pages("Pages free:") + pages("Pages inactive:")
+                + pages("Pages speculative:") + pages("Pages purgeable:")) * page
+            let totalGB = total / 1_073_741_824
+            let availableGB = min(available / 1_073_741_824, totalGB)
+
+            let swap = run("/usr/sbin/sysctl", ["vm.swapusage"])
+            func swapGB(_ key: String) -> Double {
+                guard let range = swap.range(
+                    of: key + #"\s*=\s*([0-9.]+)\s*([KMG])"#,
+                    options: .regularExpression
+                ) else { return 0 }
+                let fragment = String(swap[range])
+                guard let numberRange = fragment.range(of: #"[0-9.]+"#,
+                                                       options: .regularExpression),
+                      let value = Double(fragment[numberRange]) else { return 0 }
+                let unit = fragment.last ?? "M"
+                switch unit {
+                case "G": return value
+                case "K": return value / 1_048_576
+                default: return value / 1024
+                }
+            }
+            let usedSwap = swapGB("used")
+            let totalSwap = swapGB("total")
+
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.metricsInFlight = false
+                self.systemCPU = cpu
+                self.ollamaCPU = ollamaCPU
+                self.memoryTotalGB = totalGB
+                self.memoryAvailableGB = availableGB
+                self.memoryUsedGB = max(0, totalGB - availableGB)
+                self.swapUsedGB = usedSwap
+                self.swapTotalGB = totalSwap
+            }
+        }
+    }
+
+    private func scheduledPoll() {
+        if Date().timeIntervalSince(lastMetricsPoll) >= 3 {
+            lastMetricsPoll = Date()
+            refreshSystemMetrics()
+        }
+        let interval = AppSettings.shared.refreshInterval
+        guard Date().timeIntervalSince(lastPoll) >= interval else {
+            return
+        }
+        lastPoll = Date()
+        poll()
+    }
+
+    private func poll() {
+        fetchOllama()
+        readNewLog()
+        updateElapsed()
+    }
+
+    // MARK: - Initial Log
+
+    private func loadInitialLog() {
+
+        guard let handle = try? FileHandle(forReadingFrom: logPath) else {
+            return
+        }
+
+        defer {
+            try? handle.close()
+        }
+
+        let fileSize = (try? handle.seekToEnd()) ?? 0
+
+        logOffset = fileSize
+
+        if let attributes = try? FileManager.default.attributesOfItem(
+            atPath: logPath.path
+        ) {
+            logFileIdentity = "\(attributes[.systemNumber] ?? ""):\(attributes[.systemFileNumber] ?? "")"
+        }
+
+        // Only inspect the recent portion of the log.
+        let tailSize: UInt64 = 512 * 1024
+
+        if fileSize > tailSize {
+            try? handle.seek(toOffset: fileSize - tailSize)
+        } else {
+            try? handle.seek(toOffset: 0)
+        }
+
+        guard let data = try? handle.readToEnd(),
+              let text = String(data: data, encoding: .utf8) else {
+            return
+        }
+
+        for line in text.components(separatedBy: .newlines) {
+            processLogLine(line)
+        }
+    }
+
+    // MARK: - API
+
+    private func fetchOllama() {
+
+        let base = AppSettings.shared.serverURL
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "/+", with: "", options: .regularExpression)
+
+        guard !base.isEmpty,
+              let url = URL(string: base + "/api/ps") else {
+            ollamaOnline = false
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 1
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+
+            guard let self else {
+                return
+            }
+
+            Task { @MainActor in
+
+                guard let data,
+                      let http = response as? HTTPURLResponse,
+                      http.statusCode == 200 else {
+
+                    self.ollamaOnline = false
+                    return
+                }
+
+                do {
+                    let result = try JSONDecoder().decode(
+                        OllamaResponse.self,
+                        from: data
+                    )
+
+                    self.ollamaOnline = true
+
+                    if let model = result.models.first {
+
+                        self.modelName = model.name
+
+                        let gb = Double(model.size) / 1_000_000_000
+                        self.modelSize = String(format: "%.1f GB", gb)
+
+                        if model.sizeVRAM > 0 {
+
+                            let vram = Double(model.sizeVRAM) / 1_000_000_000
+
+                            self.processor = String(
+                                format: "GPU  %.1f GB VRAM",
+                                vram
+                            )
+
+                        } else {
+                            self.processor = "CPU"
+                        }
+
+                        self.context = "\(model.contextLength)"
+
+                    } else {
+
+                        self.modelName = "-"
+                        self.modelSize = "-"
+                        self.processor = "-"
+                        self.context = "-"
+                    }
+
+                } catch {
+
+                    self.ollamaOnline = true
+                }
+            }
+
+        }.resume()
+    }
+
+    // MARK: - Log
+
+    private func readNewLog() {
+
+        guard let attributes = try? FileManager.default.attributesOfItem(
+            atPath: logPath.path
+        ) else {
+            return
+        }
+
+        let identity = "\(attributes[.systemNumber] ?? ""):\(attributes[.systemFileNumber] ?? "")"
+
+        guard let handle = try? FileHandle(forReadingFrom: logPath) else {
+            return
+        }
+
+        defer {
+            try? handle.close()
+        }
+
+        let currentSize = (try? handle.seekToEnd()) ?? 0
+
+        // Reset the read position if Ollama replaced or truncated the log.
+        if identity != logFileIdentity || currentSize < logOffset {
+            logOffset = 0
+            logFileIdentity = identity
+        }
+
+        guard currentSize > logOffset else {
+            return
+        }
+
+        try? handle.seek(toOffset: logOffset)
+
+        guard let data = try? handle.readToEnd(),
+              let text = String(data: data, encoding: .utf8) else {
+            return
+        }
+
+        logOffset = currentSize
+
+        for line in text.components(separatedBy: .newlines) {
+            processLogLine(line)
+        }
+    }
+
+    // MARK: - Log Parser
+
+    private func processLogLine(_ line: String) {
+
+        guard !line.isEmpty else {
+            return
+        }
+
+        let lower = line.lowercased()
+
+        // Ignore the monitor's own API polling.
+        if lower.contains("get \"/api/ps\"") ||
+           lower.contains("get /api/ps") {
+            return
+        }
+
+        // Prompt processing
+        if lower.contains("prompt processing") {
+
+            // Start each Ollama request with fresh statistics.
+            if requestStart == nil {
+                promptProgress = 0
+                promptTokens = "-"
+                promptSpeed = "-"
+                generationTokens = "-"
+                generationSpeed = "-"
+                elapsed = "-"
+                requestStart = Date()
+            }
+
+            state = "PROCESSING"
+            activity = "Processing context..."
+            lastRequestLogAt = Date()
+
+            if promptProgress == 0 {
+                generationTokens = "-"
+                generationSpeed = "-"
+            }
+
+            if let tokens = extractNumber(
+                after: "n_tokens =",
+                from: line
+            ) {
+                promptTokens = formatNumber(tokens)
+            }
+
+            if let progress = extractNumber(
+                after: "progress =",
+                from: line
+            ) {
+
+                promptProgress = min(max(progress, 0), 1)
+
+                activity = String(
+                    format: "Processing prompt  %.0f%%",
+                    progress * 100
+                )
+            }
+
+            if let speed = extractSpeed(line) {
+
+                promptSpeed = String(
+                    format: "%.1f tok/s",
+                    speed
+                )
+            }
+
+            lastActivity = shortActivity(line)
+
+            return
+        }
+
+        // Generation begins
+        if lower.contains("init_sampler") {
+
+            state = "GENERATING"
+            activity = "Generating response..."
+            lastRequestLogAt = Date()
+
+            // Prompt progress is no longer meaningful during generation.
+            promptProgress = 0
+
+            if requestStart == nil {
+                requestStart = Date()
+            }
+
+            lastActivity = shortActivity(line)
+
+            return
+        }
+
+        // Generation timing
+        if lower.contains("tg =") ||
+           lower.contains("tg=") {
+
+            state = "GENERATING"
+            activity = "Generating response..."
+            lastRequestLogAt = Date()
+
+            if let tokens = extractNumber(
+                after: "n_decoded =",
+                from: line
+            ) {
+                generationTokens = formatNumber(tokens)
+            }
+
+            if let speed = extractSpeed(line) {
+
+                generationSpeed = String(
+                    format: "%.1f tok/s",
+                    speed
+                )
+            }
+
+            lastActivity = shortActivity(line)
+
+            return
+        }
+
+    // Stop/cancel
+        if lower.contains("srv stop") ||
+           lower.contains("cancel task") ||
+           lower.contains("stop processing") {
+
+            lastActivity = shortActivity(line)
+            return
+        }
+
+        // Idle: debounce briefly so unrelated idle messages cannot
+        // hide live generation stats between token updates.
+        if lower.contains("all slots are idle") {
+            let observedActivity = lastRequestLogAt
+            lastActivity = shortActivity(line)
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                guard let self = self,
+                      self.lastRequestLogAt == observedActivity else {
+                    return
+                }
+
+                self.state = "IDLE"
+                self.activity = "No active generation"
+                self.requestStart = nil
+                self.elapsed = "-"
+                self.promptProgress = 0
+            }
+
+            return
+        }
+
+        // Slot activity
+        if lower.contains("slot operator") ||
+           lower.contains("slot update") ||
+           lower.contains("slot release") {
+
+            lastActivity = shortActivity(line)
+        }
+    }
+
+    // MARK: - Helpers
+
+    private func extractNumber(
+        after marker: String,
+        from line: String
+    ) -> Double? {
+
+        guard let range = line.range(
+            of: marker,
+            options: .caseInsensitive
+        ) else {
+            return nil
+        }
+
+        let remainder = line[range.upperBound...]
+
+        guard let match = remainder.range(
+            of: #"[-+]?[0-9]+(?:\.[0-9]+)?"#,
+            options: .regularExpression
+        ) else {
+            return nil
+        }
+
+        return Double(remainder[match])
+    }
+
+    private func extractSpeed(_ line: String) -> Double? {
+
+        // Ollama format: "tg =   5.98 t/s"
+        if let range = line.range(
+            of: #"tg\s*=\s*([0-9.]+)\s*t/s"#,
+            options: .regularExpression
+        ) {
+            let match = String(line[range])
+
+            if let numberRange = match.range(
+                of: #"[0-9.]+"#,
+                options: .regularExpression
+            ) {
+                return Double(match[numberRange])
+            }
+        }
+
+        // Ollama long-form timing format.
+        guard let range = line.range(
+            of: "tokens per second",
+            options: [.caseInsensitive, .backwards]
+        ) else {
+            return nil
+        }
+
+        let before = line[..<range.lowerBound]
+
+        guard let slash = before.lastIndex(of: "/") else {
+            return nil
+        }
+
+        let value = before[
+            before.index(after: slash)...
+        ]
+        .trimmingCharacters(in: .whitespaces)
+
+        return Double(value)
+    }
+
+    private func formatNumber(_ number: Double) -> String {
+
+        if number >= 1000 {
+            return String(
+                format: "%.1fk",
+                number / 1000
+            )
+        }
+
+        return String(
+            format: "%.0f",
+            number
+        )
+    }
+
+    private func shortActivity(_ line: String) -> String {
+
+        if line.count > 100 {
+            return String(line.suffix(100))
+        }
+
+        return line
+    }
+
+    private func updateElapsed() {
+
+        guard let start = requestStart,
+              state != "IDLE" else {
+            return
+        }
+
+        let seconds = Int(
+            Date().timeIntervalSince(start)
+        )
+
+        let hours = seconds / 3600
+        let minutes = (seconds % 3600) / 60
+        let secs = seconds % 60
+
+        if hours > 0 {
+
+            elapsed = String(
+                format: "%dh %02dm %02ds",
+                hours,
+                minutes,
+                secs
+            )
+
+        } else {
+
+            elapsed = String(
+                format: "%dm %02ds",
+                minutes,
+                secs
+            )
+        }
+    }
+
+    // MARK: - Ollama Controls
+
+
+    func startOllama() {
+        guard !isBusy else { return }
+        isBusy = true
+        let appPath = AppSettings.shared.appPath
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+            process.arguments = ["-a", appPath]
+            try? process.run()
+            process.waitUntilExit()
+
+            DispatchQueue.main.async {
+                self.isBusy = false
+            }
+        }
+    }
+
+
+
+    func stopOllama() {
+        guard !isBusy else { return }
+        isBusy = true
+        let appName = AppSettings.shared.appDisplayName
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            process.arguments = [
+                "-e", "tell application \"\(appName)\" to quit"
+            ]
+            try? process.run()
+            process.waitUntilExit()
+
+            DispatchQueue.main.async {
+                self.isBusy = false
+                self.state = "IDLE"
+                self.activity = "Ollama stopped"
+                self.requestStart = nil
+                self.elapsed = "-"
+            }
+        }
+    }
+
+
+
+    func restartOllama() {
+        guard !isBusy else { return }
+        isBusy = true
+        let appName = AppSettings.shared.appDisplayName
+        let appPath = AppSettings.shared.appPath
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let stop = Process()
+            stop.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            stop.arguments = [
+                "-e", "tell application \"\(appName)\" to quit"
+            ]
+            try? stop.run()
+            stop.waitUntilExit()
+
+            Thread.sleep(forTimeInterval: 1.0)
+
+            let start = Process()
+            start.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+            start.arguments = ["-a", appPath]
+            try? start.run()
+            start.waitUntilExit()
+
+            DispatchQueue.main.async {
+                self.isBusy = false
+                self.state = "IDLE"
+                self.activity = "Ollama restarting..."
+            }
+        }
+    }
+}
+
+// MARK: - UI
+
+private struct ContentHeightPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+struct ContentView: View {
+    var onHeightChange: ((CGFloat) -> Void)? = nil
+    @State private var isSystemPerformanceExpanded = false
+
+    @StateObject private var monitor = Monitor()
+
+    private var statusText: String {
+        switch monitor.state {
+        case "GENERATING":
+            return "Generating response..."
+        case "PROCESSING":
+            return "Processing prompt..."
+        default:
+            if monitor.activity == "Ollama restarting..." {
+                return monitor.activity
+            }
+            return monitor.ollamaOnline ? "Idle" : "Ollama offline"
+        }
+    }
+
+    var body: some View {
+
+        VStack(alignment: .leading, spacing: 0) {
+
+            // Header
+            HStack {
+
+                VStack(alignment: .leading, spacing: 3) {
+
+                    Text("Ollama Monitor")
+                        .font(.title2)
+                        .bold()
+
+                    HStack(spacing: 6) {
+
+                        Circle()
+                            .fill(
+                                monitor.ollamaOnline
+                                ? Color.green
+                                : Color.red
+                            )
+                            .frame(
+                                width: 8,
+                                height: 8
+                            )
+
+                        Text(
+                            monitor.ollamaOnline
+                            ? "Ollama Online"
+                            : "Ollama Offline"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+                }
+
+                Spacer()
+
+                if monitor.isBusy {
+
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+
+            Divider()
+                .padding(.vertical, 14)
+
+            // Model
+            VStack(alignment: .leading, spacing: 5) {
+
+                Text(monitor.modelName)
+                    .font(.headline)
+
+                HStack(spacing: 12) {
+                    Text("Context: \(monitor.context)")
+                    Text("Model: \(monitor.modelSize)")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+            }
+
+            Divider()
+                .padding(.vertical, 14)
+
+            // Activity
+            VStack(alignment: .leading, spacing: 9) {
+                HStack {
+                    Text("ACTIVITY")
+                        .font(.caption)
+                        .bold()
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+
+                GeometryReader { geometry in
+                    ZStack(alignment: .leading) {
+                        RoundedRectangle(cornerRadius: 6)
+                            .fill(Color.secondary.opacity(0.16))
+
+                        if monitor.state == "PROCESSING" {
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(Color.orange)
+                                .frame(
+                                    width: geometry.size.width *
+                                        min(max(monitor.promptProgress, 0), 1)
+                                )
+                        }
+
+                        if monitor.state == "GENERATING" {
+                            ProgressView()
+                                .progressViewStyle(.linear)
+                                .tint(.green)
+                                .frame(
+                                    width: max(geometry.size.width - 8, 0),
+                                    height: 4
+                                )
+                                .position(
+                                    x: geometry.size.width / 2,
+                                    y: geometry.size.height - 4
+                                )
+                        }
+
+                        Text(
+                            monitor.state == "PROCESSING"
+                                ? String(format: "Processing prompt %.0f%%",
+                                         min(max(monitor.promptProgress, 0), 1) * 100)
+                                : monitor.state == "GENERATING"
+                                    ? "Generating response..."
+                                    : "Last generation"
+                        )
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                }
+                .frame(height: 24)
+
+                HStack(spacing: 24) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(monitor.state == "PROCESSING" ? "PROMPT TOKENS" : "GENERATED")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Text(monitor.state == "PROCESSING"
+                             ? monitor.promptTokens : monitor.generationTokens)
+                            .font(.system(size: 16, weight: .medium, design: .monospaced))
+                    }
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(monitor.state == "PROCESSING" ? "PROMPT SPEED" : "GENERATION SPEED")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Text(monitor.state == "PROCESSING"
+                             ? monitor.promptSpeed : monitor.generationSpeed)
+                            .font(.system(size: 16, weight: .medium, design: .monospaced))
+                    }
+
+                    Spacer(minLength: 0)
+
+                    VStack(alignment: .trailing, spacing: 3) {
+                        Text("ELAPSED")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Text(monitor.elapsed)
+                            .font(.system(size: 16, weight: .medium, design: .monospaced))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.75)
+                    }
+                }
+            }
+
+            Divider().padding(.vertical, 10)
+
+            // System Performance
+            Button {
+                var transaction = Transaction()
+                transaction.animation = nil
+                withTransaction(transaction) {
+                    isSystemPerformanceExpanded.toggle()
+                }
+            } label: {
+                HStack {
+                    Text("SYSTEM PERFORMANCE")
+                        .font(.caption)
+                        .bold()
+                        .foregroundStyle(.secondary)
+
+                    Spacer()
+
+                    Image(systemName: isSystemPerformanceExpanded
+                          ? "chevron.down" : "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .contentShape(Rectangle())
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("System Performance")
+            .accessibilityHint(
+                isSystemPerformanceExpanded
+                    ? "Collapse system performance details"
+                    : "Expand system performance details"
+            )
+
+            if isSystemPerformanceExpanded {
+                VStack(alignment: .leading, spacing: 9) {
+                    metricRow(
+                        title: "CPU",
+                        value: String(format: "%.0f%%", monitor.systemCPU),
+                        fraction: monitor.systemCPU / 100,
+                        color: .blue
+                    )
+
+                    metricRow(
+                        title: "OLLAMA CPU",
+                        value: String(format: "%.1f%%", monitor.ollamaCPU),
+                        fraction: min(monitor.ollamaCPU / 100, 1),
+                        color: .green
+                    )
+
+                    HStack {
+                        Text("VRAM")
+                            .font(.caption2)
+                            .bold()
+                            .foregroundStyle(.secondary)
+
+                        Spacer()
+
+                        Text(
+                            monitor.processor.replacingOccurrences(
+                                of: "GPU  ",
+                                with: ""
+                            )
+                        )
+                        .font(.system(
+                            size: 11,
+                            weight: .medium,
+                            design: .monospaced
+                        ))
+                    }
+
+                    metricRow(
+                        title: "MEMORY",
+                        value: monitor.memoryTotalGB > 0
+                            ? String(
+                                format: "%.1f / %.0f GB used",
+                                monitor.memoryUsedGB,
+                                monitor.memoryTotalGB
+                            )
+                            : "Collecting...",
+                        fraction: monitor.memoryTotalGB > 0
+                            ? monitor.memoryUsedGB / monitor.memoryTotalGB : 0,
+                        color: monitor.memoryTotalGB > 0 &&
+                            monitor.memoryAvailableGB / monitor.memoryTotalGB < 0.15
+                            ? .orange : .blue
+                    )
+
+                    HStack {
+                        Text("Available (est.)")
+                        Spacer()
+                        Text(String(format: "%.1f GB", monitor.memoryAvailableGB))
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                    metricRow(
+                        title: "SWAP",
+                        value: monitor.swapTotalGB > 0
+                            ? String(
+                                format: "%.1f / %.1f GB",
+                                monitor.swapUsedGB,
+                                monitor.swapTotalGB
+                            )
+                            : "0 GB used",
+                        fraction: monitor.swapTotalGB > 0
+                            ? monitor.swapUsedGB / monitor.swapTotalGB : 0,
+                        color: monitor.swapUsedGB >= 2 ? .orange : .secondary
+                    )
+
+                    Text("Available memory is estimated from macOS VM statistics. GPU utilization is not available from this monitor.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.top, 8)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+
+            Divider().padding(.vertical, 10)
+
+            // Controls
+            // Controls
+            VStack(alignment: .leading, spacing: 8) {
+
+                Text("OLLAMA")
+                    .font(.caption)
+                    .bold()
+                    .foregroundStyle(.secondary)
+
+                HStack(spacing: 8) {
+
+                    Button {
+                        monitor.startOllama()
+                    } label: {
+
+                        Label(
+                            "Start",
+                            systemImage: "play.fill"
+                        )
+                        .frame(
+                            maxWidth: .infinity
+                        )
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(Color.green.opacity(0.15))
+                    .disabled(
+                        monitor.ollamaOnline ||
+                        monitor.isBusy
+                    )
+
+                    Button {
+                        monitor.stopOllama()
+                    } label: {
+
+                        Label(
+                            "Stop",
+                            systemImage: "stop.fill"
+                        )
+                        .frame(
+                            maxWidth: .infinity
+                        )
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(Color.red.opacity(0.15))
+                    .disabled(
+                        !monitor.ollamaOnline ||
+                        monitor.isBusy
+                    )
+
+                    Button {
+                        monitor.restartOllama()
+                    } label: {
+
+                        Label(
+                            "Restart",
+                            systemImage: "arrow.clockwise"
+                        )
+                        .frame(
+                            maxWidth: .infinity
+                        )
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(
+                        !monitor.ollamaOnline ||
+                        monitor.isBusy
+                    )
+                }
+            }
+
+            Spacer()
+
+            // Footer
+            VStack(spacing: 7) {
+                HStack {
+                    Text("Status")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Spacer()
+
+                    Text(statusText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                HStack {
+                    Text("Last activity")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Spacer()
+
+                    Text(monitor.lastActivity)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 500)
+        .fixedSize(horizontal: false, vertical: true)
+        .background(
+            GeometryReader { geometry in
+                Color.clear.preference(
+                    key: ContentHeightPreferenceKey.self,
+                    value: geometry.size.height
+                )
+            }
+        )
+        .onPreferenceChange(ContentHeightPreferenceKey.self) { height in
+            onHeightChange?(height)
+        }
+    }
+
+    private func metricRow(
+        title: String,
+        value: String,
+        fraction: Double,
+        color: Color
+    ) -> some View {
+        VStack(spacing: 4) {
+            HStack {
+                Text(title)
+                    .font(.caption2)
+                    .bold()
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text(value)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+            }
+            GeometryReader { geometry in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.secondary.opacity(0.14))
+                    Capsule()
+                        .fill(color)
+                        .frame(width: geometry.size.width *
+                               min(max(fraction, 0), 1))
+                }
+            }
+            .frame(height: 5)
+        }
+    }
+
+    private func stat(
+        title: String,
+        value: String
+    ) -> some View {
+
+        VStack(
+            alignment: .leading,
+            spacing: 3
+        ) {
+
+            Text(title)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            Text(value)
+                .font(.system(
+                    size: 14,
+                    weight: .medium,
+                    design: .monospaced
+                ))
+        }
+    }
+}
+
+
+// MARK: - Settings Window
+
+@MainActor
+struct SettingsView: View {
+    @ObservedObject private var settings = AppSettings.shared
+
+    var body: some View {
+        Form {
+            Section("Connection") {
+                TextField("Ollama server URL", text: $settings.serverURL)
+                TextField("Server log path", text: $settings.logPath)
+                TextField("Ollama app name or path", text: $settings.appPath)
+
+                Picker("Refresh interval", selection: $settings.refreshInterval) {
+                    Text("0.5 seconds").tag(0.5)
+                    Text("1 second").tag(1.0)
+                    Text("2 seconds").tag(2.0)
+                    Text("3 seconds").tag(3.0)
+                    Text("5 seconds").tag(5.0)
+                }
+            }
+
+            HStack {
+                Spacer()
+                Button("Restore Defaults") {
+                    settings.restoreDefaults()
+                }
+            }
+
+            Text("Changes are saved automatically.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(20)
+        .frame(width: 440)
+    }
+}
+
+// MARK: - About Window
+
+struct AboutView: View {
+    var body: some View {
+        VStack(spacing: 10) {
+            Image(nsImage: NSApplication.shared.applicationIconImage)
+                .resizable()
+                .frame(width: 64, height: 64)
+
+            Text("Ollama Monitor")
+                .font(.title2)
+                .bold()
+
+            Text("Version 0.19")
+                .foregroundStyle(.secondary)
+
+            Text("David Lomneck")
+            Text("Copyright © 2026 David Lomneck")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(28)
+        .frame(width: 340, height: 240)
+    }
+}
+
+// MARK: - Native Menu Bar App
+
+extension Notification.Name {
+    static let ollamaMonitorShowSettings =
+        Notification.Name("OllamaMonitorShowSettings")
+    static let ollamaMonitorShowAbout =
+        Notification.Name("OllamaMonitorShowAbout")
+}
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var statusItem: NSStatusItem!
+    private var dashboardPanel: NSPanel?
+    private var settingsWindow: NSWindow?
+    private var aboutWindow: NSWindow?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+
+        statusItem = NSStatusBar.system.statusItem(
+            withLength: NSStatusItem.variableLength
+        )
+
+        if let button = statusItem.button {
+            button.image = NSImage(
+                systemSymbolName: "cpu",
+                accessibilityDescription: "Ollama Monitor"
+            )
+            button.toolTip = "Ollama Monitor"
+            button.target = self
+            button.action = #selector(statusItemClicked(_:))
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        }
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(showSettingsFromNotification(_:)),
+            name: .ollamaMonitorShowSettings,
+            object: nil
+        )
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(showAboutFromNotification(_:)),
+            name: .ollamaMonitorShowAbout,
+            object: nil
+        )
+    }
+
+    @objc private func statusItemClicked(_ sender: Any?) {
+        guard let button = statusItem.button else { return }
+
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            showContextMenu(from: button)
+        } else {
+            toggleDashboard()
+        }
+    }
+
+    private func showContextMenu(from button: NSButton) {
+        let menu = NSMenu()
+
+        let settings = NSMenuItem(
+            title: "Settings",
+            action: #selector(showSettings(_:)),
+            keyEquivalent: ""
+        )
+        settings.target = self
+        menu.addItem(settings)
+
+        let about = NSMenuItem(
+            title: "About Ollama Monitor",
+            action: #selector(showAbout(_:)),
+            keyEquivalent: ""
+        )
+        about.target = self
+        menu.addItem(about)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let quit = NSMenuItem(
+            title: "Quit",
+            action: #selector(quitApp(_:)),
+            keyEquivalent: ""
+        )
+        quit.target = self
+        menu.addItem(quit)
+
+        menu.popUp(
+            positioning: nil,
+            at: NSPoint(x: 0, y: button.bounds.height),
+            in: button
+        )
+    }
+
+    private func toggleDashboard() {
+        if let panel = dashboardPanel, panel.isVisible {
+            panel.orderOut(nil)
+            return
+        }
+
+        let panel: NSPanel
+
+        if let existing = dashboardPanel {
+            panel = existing
+        } else {
+            panel = NSPanel(
+                contentRect: NSRect(
+                    x: 0, y: 0, width: 520, height: 800
+                ),
+                styleMask: [.titled, .closable, .utilityWindow],
+                backing: .buffered,
+                defer: false
+            )
+
+            panel.title = "Ollama Monitor"
+            panel.level = .floating
+            panel.hidesOnDeactivate = false
+            panel.isReleasedWhenClosed = false
+            panel.collectionBehavior = [
+                .canJoinAllSpaces,
+                .fullScreenAuxiliary
+            ]
+            panel.contentViewController = NSHostingController(
+                rootView: ContentView { [weak self, weak panel] height in
+                    guard let self, let panel, height > 0 else {
+                        return
+                    }
+
+                    let currentHeight = panel.contentView?.bounds.height ?? 0
+                    guard abs(currentHeight - height) > 1 else {
+                        return
+                    }
+
+                    let oldFrame = panel.frame
+                    let newSize = NSSize(width: 500, height: height)
+                    let heightDelta = newSize.height - oldFrame.size.height
+
+                    var newFrame = oldFrame
+                    newFrame.size = newSize
+                    newFrame.origin.y -= heightDelta
+
+                    panel.setFrame(newFrame, display: true, animate: false)
+                }
+            )
+
+            dashboardPanel = panel
+        }
+
+        positionDashboard(panel)
+        panel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func positionDashboard(_ panel: NSPanel) {
+        guard
+            let button = statusItem.button,
+            let buttonWindow = button.window,
+            let screen = buttonWindow.screen
+        else {
+            panel.center()
+            return
+        }
+
+        let buttonRect = button.convert(button.bounds, to: nil)
+        let screenRect = buttonWindow.convertToScreen(buttonRect)
+        let visible = screen.visibleFrame
+        let frame = panel.frame
+
+        let x = min(
+            max(screenRect.midX - frame.width / 2, visible.minX),
+            visible.maxX - frame.width
+        )
+
+        let y = max(
+            visible.minY,
+            screenRect.minY - frame.height - 6
+        )
+
+        panel.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
+    @objc private func showSettingsFromNotification(
+        _ notification: Notification
+    ) {
+        showSettings(nil)
+    }
+
+    @objc private func showAboutFromNotification(
+        _ notification: Notification
+    ) {
+        showAbout(nil)
+    }
+
+    @objc private func showSettings(_ sender: Any?) {
+        if settingsWindow == nil {
+            let window = NSWindow(
+                contentRect: NSRect(
+                    x: 0, y: 0, width: 440, height: 300
+                ),
+                styleMask: [.titled, .closable, .miniaturizable],
+                backing: .buffered,
+                defer: false
+            )
+            window.title = "Ollama Monitor Settings"
+            window.isReleasedWhenClosed = false
+            window.contentViewController = NSHostingController(
+                rootView: SettingsView()
+            )
+            settingsWindow = window
+        }
+
+        settingsWindow?.center()
+        settingsWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func showAbout(_ sender: Any?) {
+        if aboutWindow == nil {
+            let window = NSWindow(
+                contentRect: NSRect(
+                    x: 0, y: 0, width: 340, height: 240
+                ),
+                styleMask: [.titled, .closable],
+                backing: .buffered,
+                defer: false
+            )
+            window.title = "About Ollama Monitor"
+            window.isReleasedWhenClosed = false
+            window.contentViewController = NSHostingController(
+                rootView: AboutView()
+            )
+            aboutWindow = window
+        }
+
+        aboutWindow?.center()
+        aboutWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func quitApp(_ sender: Any?) {
+        NSApp.terminate(nil)
+    }
+}
+
+@main
+struct OllamaMonitorApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self)
+    private var appDelegate
+
+    var body: some Scene {
+        Settings {
+            SettingsView()
+        }
+    }
+}
