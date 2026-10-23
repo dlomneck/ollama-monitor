@@ -11,7 +11,11 @@ let package = Package(
         .target(name: "MonitorCore"),
         .executableTarget(
             name: "OllamaMonitor",
-            dependencies: ["MonitorCore"]
+            dependencies: ["MonitorCore"],
+            exclude: [
+                "main.swift.backup-20261010-002831",
+                "main.swift.backup-20261010-003556"
+            ]
         ),
         .testTarget(
             name: "MonitorCoreTests",

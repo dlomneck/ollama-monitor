@@ -5,25 +5,6 @@ import MonitorCore
 
 // MARK: - Ollama API
 
-struct OllamaResponse: Decodable {
-    let models: [OllamaModel]
-}
-
-struct OllamaModel: Decodable {
-    let name: String
-    let size: Int64
-    let sizeVRAM: Int64
-    let contextLength: Int
-
-    enum CodingKeys: String, CodingKey {
-        case name
-        case size
-        case sizeVRAM = "size_vram"
-        case contextLength = "context_length"
-    }
-}
-
-
 // MARK: - Persistent Settings
 
 struct MonitorSettingsData: Codable {
@@ -221,6 +202,10 @@ final class Monitor: ObservableObject {
     @Published var isBusy = false
     @Published var controlMessage = ""
     @Published var controlMessageIsError = false
+    @Published private(set) var loadedModels: [OllamaLoadedModel] = []
+    @Published private(set) var unloadingModels: Set<String> = []
+    @Published private(set) var lastSuccessfulPoll: Date?
+    @Published private(set) var monitoringStale = true
 
     // Model
     @Published var modelName = "-"
@@ -455,7 +440,7 @@ final class Monitor: ObservableObject {
 
     private func fetchOllama() {
 
-        guard !isBusy else { return }
+        guard !isBusy, unloadingModels.isEmpty else { return }
         guard apiRequestGate.begin() else { return }
 
         let base = AppSettings.shared.serverURL
@@ -466,6 +451,8 @@ final class Monitor: ObservableObject {
               let url = URL(string: base + "/api/ps") else {
             apiRequestGate.finish()
             ollamaOnline = false
+            monitoringStale = true
+            clearLoadedModelDetails()
             logDiagnostic("invalid-server-url", "Invalid Ollama server URL.")
             return
         }
@@ -492,6 +479,8 @@ final class Monitor: ObservableObject {
                       http.statusCode == 200 else {
 
                     self.ollamaOnline = false
+                    self.monitoringStale = true
+                    self.clearLoadedModelDetails()
                     if let error {
                         self.logDiagnostic("api-request", "Ollama API request failed: \(error.localizedDescription)")
                     } else if let http = response as? HTTPURLResponse {
@@ -502,52 +491,43 @@ final class Monitor: ObservableObject {
                     return
                 }
 
-                do {
-                    let result = try JSONDecoder().decode(
-                        OllamaResponse.self,
-                        from: data
-                    )
-
+                guard let state = OllamaProcessListDecoder.decode(
+                    statusCode: http.statusCode,
+                    data: data,
+                    failed: false
+                ) else {
                     self.ollamaOnline = true
-                    self.diagnosticLastLoggedAt.removeValue(forKey: "api-request")
-                    self.diagnosticLastLoggedAt.removeValue(forKey: "api-http")
-                    self.diagnosticLastLoggedAt.removeValue(forKey: "api-response")
-                    self.diagnosticLastLoggedAt.removeValue(forKey: "api-decode")
+                    self.monitoringStale = true
+                    self.logDiagnostic("api-decode", "Could not decode Ollama /api/ps response.")
+                    return
+                }
+                guard case let .available(models) = state else { return }
 
-                    if let model = result.models.first {
+                self.ollamaOnline = true
+                self.monitoringStale = false
+                self.lastSuccessfulPoll = Date()
+                self.loadedModels = models
+                self.diagnosticLastLoggedAt.removeValue(forKey: "api-request")
+                self.diagnosticLastLoggedAt.removeValue(forKey: "api-http")
+                self.diagnosticLastLoggedAt.removeValue(forKey: "api-response")
+                self.diagnosticLastLoggedAt.removeValue(forKey: "api-decode")
 
-                        self.modelName = model.name
+                if let model = models.first {
+                    self.modelName = model.name
+                    let gb = Double(model.size) / 1_000_000_000
+                    self.modelSize = String(format: "%.1f GB", gb)
 
-                        let gb = Double(model.size) / 1_000_000_000
-                        self.modelSize = String(format: "%.1f GB", gb)
-
-                        if model.sizeVRAM > 0 {
-
-                            let vram = Double(model.sizeVRAM) / 1_000_000_000
-
-                            self.processor = String(
-                                format: "GPU  %.1f GB VRAM",
-                                vram
-                            )
-
-                        } else {
-                            self.processor = "CPU"
-                        }
-
-                        self.context = "\(model.contextLength)"
-
+                    if model.sizeVRAM > 0 {
+                        let vram = Double(model.sizeVRAM) / 1_000_000_000
+                        self.processor = String(format: "GPU  %.1f GB VRAM", vram)
                     } else {
-
-                        self.modelName = "-"
-                        self.modelSize = "-"
-                        self.processor = "-"
-                        self.context = "-"
+                        self.processor = "CPU"
                     }
 
-                } catch {
+                    self.context = "\(model.contextLength)"
 
-                    self.ollamaOnline = true
-                    self.logDiagnostic("api-decode", "Could not decode Ollama /api/ps response: \(error.localizedDescription)")
+                } else {
+                    self.clearLoadedModelDetails()
                 }
             }
 
@@ -555,68 +535,73 @@ final class Monitor: ObservableObject {
         apiRequestTask?.resume()
     }
 
+    private func clearLoadedModelDetails() {
+        loadedModels = []
+        modelName = "-"
+        modelSize = "-"
+        processor = "-"
+        context = "-"
+    }
+
+    func unloadModel(_ model: OllamaLoadedModel) {
+        guard !isBusy, !unloadingModels.contains(model.name), let base = URL(string:
+            AppSettings.shared.serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: "/+$", with: "", options: .regularExpression)
+                + "/api/generate") else { return }
+
+        unloadingModels.insert(model.name)
+        monitoringStale = true
+        controlMessage = "Unloading \(model.name)…"
+        controlMessageIsError = false
+        apiRequestToken = UUID()
+        apiRequestTask?.cancel()
+        apiRequestTask = nil
+        apiRequestGate.finish()
+        var request = URLRequest(url: base)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 10
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "model": model.name,
+            "keep_alive": 0
+        ])
+
+        URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
+            Task { @MainActor in
+                guard let self else { return }
+                self.unloadingModels.remove(model.name)
+                guard error == nil,
+                      let http = response as? HTTPURLResponse,
+                      (200..<300).contains(http.statusCode) else {
+                    let detail = error?.localizedDescription
+                        ?? "HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)"
+                    self.controlMessage = "Could not unload \(model.name): \(detail)"
+                    self.controlMessageIsError = true
+                    return
+                }
+                self.controlMessage = "Unloaded \(model.name)."
+                self.controlMessageIsError = false
+                self.poll()
+            }
+        }.resume()
+    }
+
     // MARK: - Log
 
     private func readNewLog() {
-
-        guard let attributes = try? FileManager.default.attributesOfItem(
-            atPath: logPath.path
-        ) else {
-            logDiagnostic("log-stat", "Could not read server log attributes at \(logPath.path).")
-            return
-        }
-
-        let identity = "\(attributes[.systemNumber] ?? ""):\(attributes[.systemFileNumber] ?? "")"
-
-        guard let handle = try? FileHandle(forReadingFrom: logPath) else {
-            logDiagnostic("log-open", "Could not open server log at \(logPath.path).")
-            return
-        }
-
-        defer {
-            try? handle.close()
-        }
-
-        let currentSize: UInt64
         do {
-            currentSize = try handle.seekToEnd()
+            guard let lines = try logCursor.readAppendedLines(at: logPath) else { return }
+            diagnosticLastLoggedAt.removeValue(forKey: "log-stat")
+            diagnosticLastLoggedAt.removeValue(forKey: "log-open")
+            diagnosticLastLoggedAt.removeValue(forKey: "log-read")
+            diagnosticLastLoggedAt.removeValue(forKey: "log-decode")
+            for line in lines {
+                processLogLine(line)
+            }
+        } catch LogFileCursorError.invalidUTF8 {
+            logDiagnostic("log-decode", "Could not decode appended server log bytes as UTF-8; will retry from the same offset.")
         } catch {
-            logDiagnostic("log-seek-end", "Could not determine server log size: \(error.localizedDescription)")
-            return
-        }
-
-        // Reset the read position if Ollama replaced or truncated the log.
-        if logCursor.prepareRead(identity: identity, size: currentSize) {
-            NSLog("Ollama Monitor: Server log was replaced or truncated; restarting log read.")
-        }
-
-        guard currentSize > logCursor.offset else {
-            return
-        }
-
-        let data: Data
-        do {
-            try handle.seek(toOffset: logCursor.offset)
-            data = try handle.readToEnd() ?? Data()
-        } catch {
-            logDiagnostic("log-read", "Could not read appended server log data: \(error.localizedDescription)")
-            return
-        }
-
-        guard let text = String(data: data, encoding: .utf8) else {
-            logDiagnostic("log-decode", "Could not decode appended server log data as UTF-8; will retry from the same offset.")
-            return
-        }
-
-        logCursor.advance(to: currentSize)
-        diagnosticLastLoggedAt.removeValue(forKey: "log-stat")
-        diagnosticLastLoggedAt.removeValue(forKey: "log-open")
-        diagnosticLastLoggedAt.removeValue(forKey: "log-seek-end")
-        diagnosticLastLoggedAt.removeValue(forKey: "log-read")
-        diagnosticLastLoggedAt.removeValue(forKey: "log-decode")
-
-        for line in text.components(separatedBy: .newlines) {
-            processLogLine(line)
+            logDiagnostic("log-read", "Could not read appended server log at \(logPath.path): \(error.localizedDescription)")
         }
     }
 
@@ -921,6 +906,14 @@ final class Monitor: ObservableObject {
         case stop
         case restart
 
+        var planAction: MonitorCore.OllamaControlAction {
+            switch self {
+            case .start: return .start
+            case .stop: return .stop
+            case .restart: return .restart
+            }
+        }
+
         var progressMessage: String {
             switch self {
             case .start: return "Starting Ollama…"
@@ -939,6 +932,7 @@ final class Monitor: ObservableObject {
     private func performOllamaControl(_ action: OllamaControlAction) {
         guard !isBusy else { return }
         isBusy = true
+        monitoringStale = true
         controlMessage = action.progressMessage
         controlMessageIsError = false
         apiRequestToken = UUID()
@@ -966,6 +960,9 @@ final class Monitor: ObservableObject {
                         )
                     }
 
+                }
+
+                func confirmOffline() throws {
                     guard waitForOllama(serverURL: serverURL, online: false) else {
                         throw ControlCommandFailure(
                             message: "Ollama’s API is still responding after 15 seconds."
@@ -973,8 +970,11 @@ final class Monitor: ObservableObject {
                     }
                 }
 
-                func startServer() throws {
+                func launchServer() throws {
                     try runControlCommand("/usr/bin/open", arguments: ["-a", appPath])
+                }
+
+                func confirmOnline() throws {
                     guard waitForOllama(serverURL: serverURL, online: true) else {
                         throw ControlCommandFailure(
                             message: "Ollama did not respond within 15 seconds."
@@ -982,26 +982,37 @@ final class Monitor: ObservableObject {
                     }
                 }
 
+                if case .start = action,
+                   appPID != nil,
+                   !ollamaAPIResponds(serverURL: serverURL) {
+                        try stopServer()
+                        try confirmOffline()
+                }
+
+                try OllamaControlPlan.execute(
+                    OllamaControlPlan.steps(for: action.planAction)
+                ) { step in
+                    switch step {
+                    case .stop: try stopServer()
+                    case .confirmOffline: try confirmOffline()
+                    case .pauseBeforeLaunch: Thread.sleep(forTimeInterval: 0.5)
+                    case .launch: try launchServer()
+                    case .confirmOnline: try confirmOnline()
+                    }
+                }
+
                 switch action {
                 case .start:
-                    if appPID != nil && !ollamaAPIResponds(serverURL: serverURL) {
-                        try stopServer()
-                    }
-                    try startServer()
                     completed = true
                     resultingOnlineState = true
                     message = "Ollama started and its API is responding."
 
                 case .stop:
-                    try stopServer()
                     completed = true
                     resultingOnlineState = false
                     message = "Ollama stopped; its API is offline."
 
                 case .restart:
-                    try stopServer()
-                    Thread.sleep(forTimeInterval: 0.5)
-                    try startServer()
                     completed = true
                     resultingOnlineState = true
                     message = "Ollama restarted and its API is responding."
@@ -1017,12 +1028,10 @@ final class Monitor: ObservableObject {
 
                 guard completed, let resultingOnlineState else { return }
                 self.ollamaOnline = resultingOnlineState
+                self.monitoringStale = true
 
                 if !resultingOnlineState {
-                    self.modelName = "-"
-                    self.modelSize = "-"
-                    self.processor = "-"
-                    self.context = "-"
+                    self.clearLoadedModelDetails()
                     self.state = "IDLE"
                     self.activity = "Ollama stopped"
                     self.requestStart = nil
@@ -1034,6 +1043,7 @@ final class Monitor: ObservableObject {
                     self.promptProgress = 0
                     self.lastActivity = "Ollama stopped"
                 } else if action == .restart {
+                    self.clearLoadedModelDetails()
                     self.state = "IDLE"
                     self.activity = "Ollama restarted"
                     self.requestStart = nil
@@ -1137,6 +1147,34 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .minimumScaleFactor(0.8)
+
+                if monitor.loadedModels.count > 1 {
+                    VStack(alignment: .leading, spacing: 5) {
+                        ForEach(monitor.loadedModels) { model in
+                            HStack(spacing: 8) {
+                                Text("\(model.name) · \(ByteCountFormatter.string(fromByteCount: model.size, countStyle: .file))")
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Spacer(minLength: 0)
+                                Button(monitor.unloadingModels.contains(model.name) ? "Unloading…" : "Unload") {
+                                    monitor.unloadModel(model)
+                                }
+                                .disabled(!monitor.ollamaOnline || monitor.isBusy || monitor.unloadingModels.contains(model.name))
+                            }
+                            .font(.caption)
+                        }
+                    }
+                    .padding(.top, 4)
+                } else if let model = monitor.loadedModels.first {
+                    HStack {
+                        Spacer()
+                        Button(monitor.unloadingModels.contains(model.name) ? "Unloading…" : "Unload model") {
+                            monitor.unloadModel(model)
+                        }
+                        .font(.caption)
+                        .disabled(!monitor.ollamaOnline || monitor.isBusy || monitor.unloadingModels.contains(model.name))
+                    }
+                }
             }
 
             Divider()
@@ -1151,7 +1189,6 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                     Spacer()
                 }
-
                 GeometryReader { geometry in
                     ZStack(alignment: .leading) {
                         RoundedRectangle(cornerRadius: 6)
@@ -1375,7 +1412,7 @@ struct ContentView: View {
                     .tint(Color.green.opacity(0.15))
                     .disabled(
                         monitor.ollamaOnline ||
-                        monitor.isBusy
+                        monitor.isBusy || !monitor.unloadingModels.isEmpty
                     )
 
                     Button {
@@ -1394,7 +1431,7 @@ struct ContentView: View {
                     .tint(Color.red.opacity(0.15))
                     .disabled(
                         !monitor.ollamaOnline ||
-                        monitor.isBusy
+                        monitor.isBusy || !monitor.unloadingModels.isEmpty
                     )
 
                     Button {
@@ -1412,7 +1449,7 @@ struct ContentView: View {
                     .buttonStyle(.bordered)
                     .disabled(
                         !monitor.ollamaOnline ||
-                        monitor.isBusy
+                        monitor.isBusy || !monitor.unloadingModels.isEmpty
                     )
                 }
 
@@ -1442,6 +1479,15 @@ struct ContentView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
+                }
+
+                if let lastSuccessfulPoll = monitor.lastSuccessfulPoll {
+                    Text(monitor.monitoringStale
+                         ? "Stale · last update \(lastSuccessfulPoll, style: .time)"
+                         : "Updated \(lastSuccessfulPoll, style: .time)")
+                        .font(.caption2)
+                        .foregroundStyle(monitor.monitoringStale ? Color.orange : Color.secondary)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
                 }
 
                 HStack {
@@ -1581,7 +1627,7 @@ struct AboutView: View {
                 .font(.title2)
                 .bold()
 
-            Text("Version 0.21")
+            Text("Version 0.24")
                 .foregroundStyle(.secondary)
 
             Text("David Lomneck")
@@ -1718,8 +1764,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 .fullScreenAuxiliary
             ]
             panel.contentViewController = NSHostingController(
-                rootView: ContentView { [weak self, weak panel] height in
-                    guard let self, let panel, height > 0 else {
+                rootView: ContentView { [weak panel] height in
+                    guard let panel, height > 0 else {
                         return
                     }
 
