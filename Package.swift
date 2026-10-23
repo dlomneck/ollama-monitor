@@ -8,6 +8,14 @@ let package = Package(
         .executable(name: "OllamaMonitor", targets: ["OllamaMonitor"])
     ],
     targets: [
-        .executableTarget(name: "OllamaMonitor")
+        .target(name: "MonitorCore"),
+        .executableTarget(
+            name: "OllamaMonitor",
+            dependencies: ["MonitorCore"]
+        ),
+        .testTarget(
+            name: "MonitorCoreTests",
+            dependencies: ["MonitorCore"]
+        )
     ]
 )

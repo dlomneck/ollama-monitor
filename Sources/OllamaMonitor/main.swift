@@ -1,6 +1,7 @@
 import SwiftUI
 import Foundation
 import AppKit
+import MonitorCore
 
 // MARK: - Ollama API
 
@@ -153,12 +154,11 @@ final class Monitor: ObservableObject {
     private var lastMetricsPoll = Date.distantPast
 
     private var timer: Timer?
-    private var logOffset: UInt64 = 0
-    private var logFileIdentity: String?
+    private var logCursor = LogFileCursor()
     private var requestStart: Date?
     private var lastRequestLogAt: Date?
     private var lastPoll = Date.distantPast
-    private var apiRequestInFlight = false
+    private var apiRequestGate = PollRequestGate()
     private var diagnosticLastLoggedAt: [String: Date] = [:]
 
     private var logPath: URL {
@@ -318,12 +318,13 @@ final class Monitor: ObservableObject {
 
         let fileSize = (try? handle.seekToEnd()) ?? 0
 
-        logOffset = fileSize
+        logCursor.advance(to: fileSize)
 
         if let attributes = try? FileManager.default.attributesOfItem(
             atPath: logPath.path
         ) {
-            logFileIdentity = "\(attributes[.systemNumber] ?? ""):\(attributes[.systemFileNumber] ?? "")"
+            let identity = "\(attributes[.systemNumber] ?? ""):\(attributes[.systemFileNumber] ?? "")"
+            logCursor.setInitialPosition(identity: identity, size: fileSize)
         }
 
         // Only inspect the recent portion of the log.
@@ -349,7 +350,7 @@ final class Monitor: ObservableObject {
 
     private func fetchOllama() {
 
-        guard !apiRequestInFlight else { return }
+        guard apiRequestGate.begin() else { return }
 
         let base = AppSettings.shared.serverURL
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -357,6 +358,7 @@ final class Monitor: ObservableObject {
 
         guard !base.isEmpty,
               let url = URL(string: base + "/api/ps") else {
+            apiRequestGate.finish()
             ollamaOnline = false
             logDiagnostic("invalid-server-url", "Invalid Ollama server URL.")
             return
@@ -364,7 +366,6 @@ final class Monitor: ObservableObject {
 
         var request = URLRequest(url: url)
         request.timeoutInterval = 1
-        apiRequestInFlight = true
 
         URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
 
@@ -374,7 +375,7 @@ final class Monitor: ObservableObject {
 
             Task { @MainActor in
 
-                self.apiRequestInFlight = false
+                self.apiRequestGate.finish()
 
                 guard let data,
                       let http = response as? HTTPURLResponse,
@@ -474,21 +475,17 @@ final class Monitor: ObservableObject {
         }
 
         // Reset the read position if Ollama replaced or truncated the log.
-        if identity != logFileIdentity || currentSize < logOffset {
-            if logFileIdentity != nil {
-                NSLog("Ollama Monitor: Server log was replaced or truncated; restarting log read.")
-            }
-            logOffset = 0
-            logFileIdentity = identity
+        if logCursor.prepareRead(identity: identity, size: currentSize) {
+            NSLog("Ollama Monitor: Server log was replaced or truncated; restarting log read.")
         }
 
-        guard currentSize > logOffset else {
+        guard currentSize > logCursor.offset else {
             return
         }
 
         let data: Data
         do {
-            try handle.seek(toOffset: logOffset)
+            try handle.seek(toOffset: logCursor.offset)
             data = try handle.readToEnd() ?? Data()
         } catch {
             logDiagnostic("log-read", "Could not read appended server log data: \(error.localizedDescription)")
@@ -500,7 +497,7 @@ final class Monitor: ObservableObject {
             return
         }
 
-        logOffset = currentSize
+        logCursor.advance(to: currentSize)
         diagnosticLastLoggedAt.removeValue(forKey: "log-stat")
         diagnosticLastLoggedAt.removeValue(forKey: "log-open")
         diagnosticLastLoggedAt.removeValue(forKey: "log-seek-end")
