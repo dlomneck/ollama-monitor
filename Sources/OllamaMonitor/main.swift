@@ -158,6 +158,8 @@ final class Monitor: ObservableObject {
     private var requestStart: Date?
     private var lastRequestLogAt: Date?
     private var lastPoll = Date.distantPast
+    private var apiRequestInFlight = false
+    private var diagnosticLastLoggedAt: [String: Date] = [:]
 
     private var logPath: URL {
         AppSettings.shared.expandedLogURL
@@ -291,6 +293,17 @@ final class Monitor: ObservableObject {
         updateElapsed()
     }
 
+    private func logDiagnostic(_ key: String, _ message: String) {
+        let now = Date()
+        guard now.timeIntervalSince(
+            diagnosticLastLoggedAt[key] ?? .distantPast
+        ) >= 30 else {
+            return
+        }
+        diagnosticLastLoggedAt[key] = now
+        NSLog("Ollama Monitor: %@", message)
+    }
+
     // MARK: - Initial Log
 
     private func loadInitialLog() {
@@ -336,6 +349,8 @@ final class Monitor: ObservableObject {
 
     private func fetchOllama() {
 
+        guard !apiRequestInFlight else { return }
+
         let base = AppSettings.shared.serverURL
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "/+", with: "", options: .regularExpression)
@@ -343,13 +358,15 @@ final class Monitor: ObservableObject {
         guard !base.isEmpty,
               let url = URL(string: base + "/api/ps") else {
             ollamaOnline = false
+            logDiagnostic("invalid-server-url", "Invalid Ollama server URL.")
             return
         }
 
         var request = URLRequest(url: url)
         request.timeoutInterval = 1
+        apiRequestInFlight = true
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
 
             guard let self else {
                 return
@@ -357,11 +374,20 @@ final class Monitor: ObservableObject {
 
             Task { @MainActor in
 
+                self.apiRequestInFlight = false
+
                 guard let data,
                       let http = response as? HTTPURLResponse,
                       http.statusCode == 200 else {
 
                     self.ollamaOnline = false
+                    if let error {
+                        self.logDiagnostic("api-request", "Ollama API request failed: \(error.localizedDescription)")
+                    } else if let http = response as? HTTPURLResponse {
+                        self.logDiagnostic("api-http", "Ollama API returned HTTP \(http.statusCode).")
+                    } else {
+                        self.logDiagnostic("api-response", "Ollama API returned no usable response.")
+                    }
                     return
                 }
 
@@ -372,6 +398,10 @@ final class Monitor: ObservableObject {
                     )
 
                     self.ollamaOnline = true
+                    self.diagnosticLastLoggedAt.removeValue(forKey: "api-request")
+                    self.diagnosticLastLoggedAt.removeValue(forKey: "api-http")
+                    self.diagnosticLastLoggedAt.removeValue(forKey: "api-response")
+                    self.diagnosticLastLoggedAt.removeValue(forKey: "api-decode")
 
                     if let model = result.models.first {
 
@@ -406,6 +436,7 @@ final class Monitor: ObservableObject {
                 } catch {
 
                     self.ollamaOnline = true
+                    self.logDiagnostic("api-decode", "Could not decode Ollama /api/ps response: \(error.localizedDescription)")
                 }
             }
 
@@ -419,12 +450,14 @@ final class Monitor: ObservableObject {
         guard let attributes = try? FileManager.default.attributesOfItem(
             atPath: logPath.path
         ) else {
+            logDiagnostic("log-stat", "Could not read server log attributes at \(logPath.path).")
             return
         }
 
         let identity = "\(attributes[.systemNumber] ?? ""):\(attributes[.systemFileNumber] ?? "")"
 
         guard let handle = try? FileHandle(forReadingFrom: logPath) else {
+            logDiagnostic("log-open", "Could not open server log at \(logPath.path).")
             return
         }
 
@@ -432,10 +465,19 @@ final class Monitor: ObservableObject {
             try? handle.close()
         }
 
-        let currentSize = (try? handle.seekToEnd()) ?? 0
+        let currentSize: UInt64
+        do {
+            currentSize = try handle.seekToEnd()
+        } catch {
+            logDiagnostic("log-seek-end", "Could not determine server log size: \(error.localizedDescription)")
+            return
+        }
 
         // Reset the read position if Ollama replaced or truncated the log.
         if identity != logFileIdentity || currentSize < logOffset {
+            if logFileIdentity != nil {
+                NSLog("Ollama Monitor: Server log was replaced or truncated; restarting log read.")
+            }
             logOffset = 0
             logFileIdentity = identity
         }
@@ -444,14 +486,26 @@ final class Monitor: ObservableObject {
             return
         }
 
-        try? handle.seek(toOffset: logOffset)
+        let data: Data
+        do {
+            try handle.seek(toOffset: logOffset)
+            data = try handle.readToEnd() ?? Data()
+        } catch {
+            logDiagnostic("log-read", "Could not read appended server log data: \(error.localizedDescription)")
+            return
+        }
 
-        guard let data = try? handle.readToEnd(),
-              let text = String(data: data, encoding: .utf8) else {
+        guard let text = String(data: data, encoding: .utf8) else {
+            logDiagnostic("log-decode", "Could not decode appended server log data as UTF-8; will retry from the same offset.")
             return
         }
 
         logOffset = currentSize
+        diagnosticLastLoggedAt.removeValue(forKey: "log-stat")
+        diagnosticLastLoggedAt.removeValue(forKey: "log-open")
+        diagnosticLastLoggedAt.removeValue(forKey: "log-seek-end")
+        diagnosticLastLoggedAt.removeValue(forKey: "log-read")
+        diagnosticLastLoggedAt.removeValue(forKey: "log-decode")
 
         for line in text.components(separatedBy: .newlines) {
             processLogLine(line)
