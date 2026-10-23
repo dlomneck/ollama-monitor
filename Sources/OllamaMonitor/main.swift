@@ -112,12 +112,115 @@ final class AppSettings: ObservableObject {
 
 // MARK: - Monitor
 
+private struct ControlCommandFailure: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
+}
+
+private func runControlCommand(
+    _ executablePath: String,
+    arguments: [String]
+) throws {
+    let process = Process()
+    let errorPipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: executablePath)
+    process.arguments = arguments
+    process.standardOutput = FileHandle.nullDevice
+    process.standardError = errorPipe
+
+    do {
+        try process.run()
+    } catch {
+        throw ControlCommandFailure(
+            message: "Could not run \(URL(fileURLWithPath: executablePath).lastPathComponent): \(error.localizedDescription)"
+        )
+    }
+
+    process.waitUntilExit()
+    let errorText = String(
+        data: errorPipe.fileHandleForReading.readDataToEndOfFile(),
+        encoding: .utf8
+    )?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+    guard process.terminationStatus == 0 else {
+        let details = errorText.isEmpty
+            ? "Command exited with status \(process.terminationStatus)."
+            : errorText
+        throw ControlCommandFailure(message: details)
+    }
+}
+
+private final class HTTPProbeResult: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+
+    func set(_ value: Bool) {
+        lock.lock()
+        self.value = value
+        lock.unlock()
+    }
+
+    func get() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
+private func ollamaAPIResponds(serverURL: String) -> Bool {
+    let base = serverURL
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .replacingOccurrences(of: "/+$", with: "", options: .regularExpression)
+    guard let url = URL(string: base + "/api/ps") else { return false }
+
+    var request = URLRequest(url: url)
+    request.timeoutInterval = 1
+
+    let result = HTTPProbeResult()
+    let semaphore = DispatchSemaphore(value: 0)
+    let task = URLSession.shared.dataTask(with: request) { _, response, error in
+        result.set(
+            error == nil && (response as? HTTPURLResponse)?.statusCode == 200
+        )
+        semaphore.signal()
+    }
+    task.resume()
+
+    guard semaphore.wait(timeout: .now() + 1.5) == .success else {
+        task.cancel()
+        return false
+    }
+    return result.get()
+}
+
+private func waitForOllama(
+    serverURL: String,
+    online expectedOnline: Bool,
+    timeout: TimeInterval = 15
+) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    var consecutiveMatches = 0
+
+    while Date() < deadline {
+        if ollamaAPIResponds(serverURL: serverURL) == expectedOnline {
+            consecutiveMatches += 1
+            if consecutiveMatches >= 2 { return true }
+        } else {
+            consecutiveMatches = 0
+        }
+        Thread.sleep(forTimeInterval: 0.25)
+    }
+    return false
+}
+
 @MainActor
 final class Monitor: ObservableObject {
 
     // Connection
     @Published var ollamaOnline = false
     @Published var isBusy = false
+    @Published var controlMessage = ""
+    @Published var controlMessageIsError = false
 
     // Model
     @Published var modelName = "-"
@@ -159,6 +262,8 @@ final class Monitor: ObservableObject {
     private var lastRequestLogAt: Date?
     private var lastPoll = Date.distantPast
     private var apiRequestGate = PollRequestGate()
+    private var apiRequestTask: URLSessionDataTask?
+    private var apiRequestToken = UUID()
     private var diagnosticLastLoggedAt: [String: Date] = [:]
 
     private var logPath: URL {
@@ -350,6 +455,7 @@ final class Monitor: ObservableObject {
 
     private func fetchOllama() {
 
+        guard !isBusy else { return }
         guard apiRequestGate.begin() else { return }
 
         let base = AppSettings.shared.serverURL
@@ -366,8 +472,10 @@ final class Monitor: ObservableObject {
 
         var request = URLRequest(url: url)
         request.timeoutInterval = 1
+        let requestToken = UUID()
+        apiRequestToken = requestToken
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+        apiRequestTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
 
             guard let self else {
                 return
@@ -375,6 +483,8 @@ final class Monitor: ObservableObject {
 
             Task { @MainActor in
 
+                guard self.apiRequestToken == requestToken else { return }
+                self.apiRequestTask = nil
                 self.apiRequestGate.finish()
 
                 guard let data,
@@ -441,7 +551,8 @@ final class Monitor: ObservableObject {
                 }
             }
 
-        }.resume()
+        }
+        apiRequestTask?.resume()
     }
 
     // MARK: - Log
@@ -793,80 +904,142 @@ final class Monitor: ObservableObject {
 
     // MARK: - Ollama Controls
 
-
     func startOllama() {
-        guard !isBusy else { return }
-        isBusy = true
-        let appPath = AppSettings.shared.appPath
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-            process.arguments = ["-a", appPath]
-            try? process.run()
-            process.waitUntilExit()
-
-            DispatchQueue.main.async {
-                self.isBusy = false
-            }
-        }
+        performOllamaControl(.start)
     }
-
-
 
     func stopOllama() {
-        guard !isBusy else { return }
-        isBusy = true
-        let appName = AppSettings.shared.appDisplayName
+        performOllamaControl(.stop)
+    }
 
-        DispatchQueue.global(qos: .userInitiated).async {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            process.arguments = [
-                "-e", "tell application \"\(appName)\" to quit"
-            ]
-            try? process.run()
-            process.waitUntilExit()
+    func restartOllama() {
+        performOllamaControl(.restart)
+    }
 
-            DispatchQueue.main.async {
-                self.isBusy = false
-                self.state = "IDLE"
-                self.activity = "Ollama stopped"
-                self.requestStart = nil
-                self.elapsed = "-"
+    private enum OllamaControlAction: Equatable {
+        case start
+        case stop
+        case restart
+
+        var progressMessage: String {
+            switch self {
+            case .start: return "Starting Ollama…"
+            case .stop: return "Stopping Ollama…"
+            case .restart: return "Restarting Ollama…"
             }
         }
     }
 
+    private func runningOllamaApplicationPID(named appName: String) -> pid_t? {
+        NSWorkspace.shared.runningApplications.first { app in
+            app.localizedName?.caseInsensitiveCompare(appName) == .orderedSame
+        }?.processIdentifier
+    }
 
-
-    func restartOllama() {
+    private func performOllamaControl(_ action: OllamaControlAction) {
         guard !isBusy else { return }
         isBusy = true
+        controlMessage = action.progressMessage
+        controlMessageIsError = false
+        apiRequestToken = UUID()
+        apiRequestTask?.cancel()
+        apiRequestTask = nil
+        apiRequestGate.finish()
+
         let appName = AppSettings.shared.appDisplayName
         let appPath = AppSettings.shared.appPath
+        let serverURL = AppSettings.shared.serverURL
+        let appPID = runningOllamaApplicationPID(named: appName)
 
         DispatchQueue.global(qos: .userInitiated).async {
-            let stop = Process()
-            stop.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            stop.arguments = [
-                "-e", "tell application \"\(appName)\" to quit"
-            ]
-            try? stop.run()
-            stop.waitUntilExit()
+            var completed = false
+            var message = ""
+            var resultingOnlineState: Bool?
 
-            Thread.sleep(forTimeInterval: 1.0)
+            do {
+                func stopServer() throws {
+                    if let appPID {
+                        try runControlCommand("/bin/kill", arguments: ["-TERM", "\(appPID)"])
+                    } else if ollamaAPIResponds(serverURL: serverURL) {
+                        throw ControlCommandFailure(
+                            message: "Ollama is online, but its app process could not be found."
+                        )
+                    }
 
-            let start = Process()
-            start.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-            start.arguments = ["-a", appPath]
-            try? start.run()
-            start.waitUntilExit()
+                    guard waitForOllama(serverURL: serverURL, online: false) else {
+                        throw ControlCommandFailure(
+                            message: "Ollama’s API is still responding after 15 seconds."
+                        )
+                    }
+                }
+
+                func startServer() throws {
+                    try runControlCommand("/usr/bin/open", arguments: ["-a", appPath])
+                    guard waitForOllama(serverURL: serverURL, online: true) else {
+                        throw ControlCommandFailure(
+                            message: "Ollama did not respond within 15 seconds."
+                        )
+                    }
+                }
+
+                switch action {
+                case .start:
+                    if appPID != nil && !ollamaAPIResponds(serverURL: serverURL) {
+                        try stopServer()
+                    }
+                    try startServer()
+                    completed = true
+                    resultingOnlineState = true
+                    message = "Ollama started and its API is responding."
+
+                case .stop:
+                    try stopServer()
+                    completed = true
+                    resultingOnlineState = false
+                    message = "Ollama stopped; its API is offline."
+
+                case .restart:
+                    try stopServer()
+                    Thread.sleep(forTimeInterval: 0.5)
+                    try startServer()
+                    completed = true
+                    resultingOnlineState = true
+                    message = "Ollama restarted and its API is responding."
+                }
+            } catch {
+                message = error.localizedDescription
+            }
 
             DispatchQueue.main.async {
                 self.isBusy = false
-                self.state = "IDLE"
-                self.activity = "Ollama restarting..."
+                self.controlMessage = message
+                self.controlMessageIsError = !completed
+
+                guard completed, let resultingOnlineState else { return }
+                self.ollamaOnline = resultingOnlineState
+
+                if !resultingOnlineState {
+                    self.modelName = "-"
+                    self.modelSize = "-"
+                    self.processor = "-"
+                    self.context = "-"
+                    self.state = "IDLE"
+                    self.activity = "Ollama stopped"
+                    self.requestStart = nil
+                    self.elapsed = "-"
+                    self.promptTokens = "-"
+                    self.promptSpeed = "-"
+                    self.generationTokens = "-"
+                    self.generationSpeed = "-"
+                    self.promptProgress = 0
+                    self.lastActivity = "Ollama stopped"
+                } else if action == .restart {
+                    self.state = "IDLE"
+                    self.activity = "Ollama restarted"
+                    self.requestStart = nil
+                    self.elapsed = "-"
+                    self.lastActivity = "Ollama restarted"
+                }
             }
         }
     }
@@ -1241,6 +1414,16 @@ struct ContentView: View {
                         !monitor.ollamaOnline ||
                         monitor.isBusy
                     )
+                }
+
+                if !monitor.controlMessage.isEmpty {
+                    Text(monitor.controlMessage)
+                        .font(.caption)
+                        .foregroundStyle(
+                            monitor.controlMessageIsError ? Color.red : Color.secondary
+                        )
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("ollama-control-status")
                 }
             }
 
