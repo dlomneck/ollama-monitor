@@ -12,3 +12,4 @@ OllamaMonitor.iconset/
 
 # Historical backups are retained locally
 backups/
+Sources/OllamaMonitor/main.swift.backup-*
