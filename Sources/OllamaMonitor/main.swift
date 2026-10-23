@@ -248,7 +248,7 @@ final class Monitor: ObservableObject {
     private var lastPoll = Date.distantPast
     private var apiRequestGate = PollRequestGate()
     private var apiRequestTask: URLSessionDataTask?
-    private var apiRequestToken = UUID()
+    private var apiRequestToken = PollRequestGeneration()
     private var diagnosticLastLoggedAt: [String: Date] = [:]
 
     private var logPath: URL {
@@ -459,8 +459,7 @@ final class Monitor: ObservableObject {
 
         var request = URLRequest(url: url)
         request.timeoutInterval = 1
-        let requestToken = UUID()
-        apiRequestToken = requestToken
+        let requestToken = apiRequestToken.advance()
 
         apiRequestTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
 
@@ -470,7 +469,7 @@ final class Monitor: ObservableObject {
 
             Task { @MainActor in
 
-                guard self.apiRequestToken == requestToken else { return }
+                guard self.apiRequestToken.accepts(requestToken) else { return }
                 self.apiRequestTask = nil
                 self.apiRequestGate.finish()
 
@@ -544,28 +543,21 @@ final class Monitor: ObservableObject {
     }
 
     func unloadModel(_ model: OllamaLoadedModel) {
-        guard !isBusy, !unloadingModels.contains(model.name), let base = URL(string:
-            AppSettings.shared.serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
-                .replacingOccurrences(of: "/+$", with: "", options: .regularExpression)
-                + "/api/generate") else { return }
+        guard !isBusy,
+              !unloadingModels.contains(model.name),
+              let request = OllamaModelUnloadRequest.make(
+                serverURL: AppSettings.shared.serverURL,
+                modelName: model.name
+              ) else { return }
 
         unloadingModels.insert(model.name)
         monitoringStale = true
         controlMessage = "Unloading \(model.name)…"
         controlMessageIsError = false
-        apiRequestToken = UUID()
+        apiRequestToken.invalidate()
         apiRequestTask?.cancel()
         apiRequestTask = nil
         apiRequestGate.finish()
-        var request = URLRequest(url: base)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 10
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: [
-            "model": model.name,
-            "keep_alive": 0
-        ])
-
         URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
             Task { @MainActor in
                 guard let self else { return }
@@ -613,16 +605,15 @@ final class Monitor: ObservableObject {
             return
         }
 
-        let lower = line.lowercased()
+        let kind = OllamaServerLogParser.classify(line)
 
         // Ignore the monitor's own API polling.
-        if lower.contains("get \"/api/ps\"") ||
-           lower.contains("get /api/ps") {
+        if kind == .monitorPoll {
             return
         }
 
         // Prompt processing
-        if lower.contains("prompt processing") {
+        if kind == .promptProcessing {
 
             // Start each Ollama request with fresh statistics.
             if requestStart == nil {
@@ -644,14 +635,14 @@ final class Monitor: ObservableObject {
                 generationSpeed = "-"
             }
 
-            if let tokens = extractNumber(
+            if let tokens = OllamaServerLogParser.extractNumber(
                 after: "n_tokens =",
                 from: line
             ) {
                 promptTokens = formatNumber(tokens)
             }
 
-            if let progress = extractNumber(
+            if let progress = OllamaServerLogParser.extractNumber(
                 after: "progress =",
                 from: line
             ) {
@@ -664,7 +655,7 @@ final class Monitor: ObservableObject {
                 )
             }
 
-            if let speed = extractSpeed(line) {
+            if let speed = OllamaServerLogParser.extractSpeed(from: line) {
 
                 promptSpeed = String(
                     format: "%.1f tok/s",
@@ -678,7 +669,7 @@ final class Monitor: ObservableObject {
         }
 
         // Generation begins
-        if lower.contains("init_sampler") {
+        if kind == .generationStart {
 
             state = "GENERATING"
             activity = "Generating response..."
@@ -697,21 +688,20 @@ final class Monitor: ObservableObject {
         }
 
         // Generation timing
-        if lower.contains("tg =") ||
-           lower.contains("tg=") {
+        if kind == .generationTiming {
 
             state = "GENERATING"
             activity = "Generating response..."
             lastRequestLogAt = Date()
 
-            if let tokens = extractNumber(
+            if let tokens = OllamaServerLogParser.extractNumber(
                 after: "n_decoded =",
                 from: line
             ) {
                 generationTokens = formatNumber(tokens)
             }
 
-            if let speed = extractSpeed(line) {
+            if let speed = OllamaServerLogParser.extractSpeed(from: line) {
 
                 generationSpeed = String(
                     format: "%.1f tok/s",
@@ -725,9 +715,7 @@ final class Monitor: ObservableObject {
         }
 
     // Stop/cancel
-        if lower.contains("srv stop") ||
-           lower.contains("cancel task") ||
-           lower.contains("stop processing") {
+        if kind == .stopped {
 
             lastActivity = shortActivity(line)
             return
@@ -735,7 +723,7 @@ final class Monitor: ObservableObject {
 
         // Idle: debounce briefly so unrelated idle messages cannot
         // hide live generation stats between token updates.
-        if lower.contains("all slots are idle") {
+        if kind == .idle {
             let observedActivity = lastRequestLogAt
             lastActivity = shortActivity(line)
 
@@ -756,78 +744,13 @@ final class Monitor: ObservableObject {
         }
 
         // Slot activity
-        if lower.contains("slot operator") ||
-           lower.contains("slot update") ||
-           lower.contains("slot release") {
+        if kind == .slotActivity {
 
             lastActivity = shortActivity(line)
         }
     }
 
     // MARK: - Helpers
-
-    private func extractNumber(
-        after marker: String,
-        from line: String
-    ) -> Double? {
-
-        guard let range = line.range(
-            of: marker,
-            options: .caseInsensitive
-        ) else {
-            return nil
-        }
-
-        let remainder = line[range.upperBound...]
-
-        guard let match = remainder.range(
-            of: #"[-+]?[0-9]+(?:\.[0-9]+)?"#,
-            options: .regularExpression
-        ) else {
-            return nil
-        }
-
-        return Double(remainder[match])
-    }
-
-    private func extractSpeed(_ line: String) -> Double? {
-
-        // Ollama format: "tg =   5.98 t/s"
-        if let range = line.range(
-            of: #"tg\s*=\s*([0-9.]+)\s*t/s"#,
-            options: .regularExpression
-        ) {
-            let match = String(line[range])
-
-            if let numberRange = match.range(
-                of: #"[0-9.]+"#,
-                options: .regularExpression
-            ) {
-                return Double(match[numberRange])
-            }
-        }
-
-        // Ollama long-form timing format.
-        guard let range = line.range(
-            of: "tokens per second",
-            options: [.caseInsensitive, .backwards]
-        ) else {
-            return nil
-        }
-
-        let before = line[..<range.lowerBound]
-
-        guard let slash = before.lastIndex(of: "/") else {
-            return nil
-        }
-
-        let value = before[
-            before.index(after: slash)...
-        ]
-        .trimmingCharacters(in: .whitespaces)
-
-        return Double(value)
-    }
 
     private func formatNumber(_ number: Double) -> String {
 
@@ -935,7 +858,7 @@ final class Monitor: ObservableObject {
         monitoringStale = true
         controlMessage = action.progressMessage
         controlMessageIsError = false
-        apiRequestToken = UUID()
+        apiRequestToken.invalidate()
         apiRequestTask?.cancel()
         apiRequestTask = nil
         apiRequestGate.finish()
@@ -1627,7 +1550,7 @@ struct AboutView: View {
                 .font(.title2)
                 .bold()
 
-            Text("Version 0.24")
+            Text("Version 0.26")
                 .foregroundStyle(.secondary)
 
             Text("David Lomneck")

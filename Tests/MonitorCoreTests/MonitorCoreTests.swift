@@ -151,6 +151,59 @@ struct MonitorCoreTests {
         #expect(executed == [.stop, .confirmOffline, .pauseBeforeLaunch, .launch])
     }
 
+    @Test func stopTimeoutDoesNotContinueIntoLaunch() {
+        enum Timeout: Error { case stillOnline }
+        var executed: [OllamaControlStep] = []
+        #expect(throws: Timeout.self) {
+            try OllamaControlPlan.execute(OllamaControlPlan.steps(for: .restart)) { step in
+                executed.append(step)
+                if step == .confirmOffline { throw Timeout.stillOnline }
+            }
+        }
+        #expect(executed == [.stop, .confirmOffline])
+    }
+
+    @Test func invalidatedPollGenerationRejectsLateResponse() {
+        var generation = PollRequestGeneration()
+        let requestToken = generation.advance()
+        #expect(generation.accepts(requestToken))
+
+        generation.invalidate()
+        #expect(!generation.accepts(requestToken))
+
+        let nextRequestToken = generation.advance()
+        #expect(generation.accepts(nextRequestToken))
+        #expect(!generation.accepts(requestToken))
+    }
+
+    @Test func unloadRequestTargetsGenerateWithImmediateExpiry() throws {
+        let request = try #require(OllamaModelUnloadRequest.make(
+            serverURL: " http://127.0.0.1:11434/ ",
+            modelName: "alpha:latest"
+        ))
+        #expect(request.url?.absoluteString == "http://127.0.0.1:11434/api/generate")
+        #expect(request.httpMethod == "POST")
+        let body = try #require(request.httpBody)
+        let payload = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        #expect(payload["model"] as? String == "alpha:latest")
+        #expect((payload["keep_alive"] as? NSNumber)?.intValue == 0)
+    }
+
+    @Test func serverLogFixturesClassifyActivityAndExtractMetrics() {
+        #expect(OllamaServerLogParser.classify(#"[GIN] 200 GET "/api/ps""#) == .monitorPoll)
+        #expect(OllamaServerLogParser.classify("prompt processing n_tokens = 256 progress = 0.75") == .promptProcessing)
+        #expect(OllamaServerLogParser.classify("init_sampler: sampler initialized") == .generationStart)
+        #expect(OllamaServerLogParser.classify("tg = 5.98 t/s n_decoded = 128") == .generationTiming)
+        #expect(OllamaServerLogParser.classify("all slots are idle") == .idle)
+        #expect(OllamaServerLogParser.classify("slot release: id 0") == .slotActivity)
+
+        let prompt = "prompt processing n_tokens = 256 progress = 0.75"
+        #expect(OllamaServerLogParser.extractNumber(after: "n_tokens =", from: prompt) == 256)
+        #expect(OllamaServerLogParser.extractNumber(after: "progress =", from: prompt) == 0.75)
+        #expect(OllamaServerLogParser.extractSpeed(from: "tg = 5.98 t/s") == 5.98)
+        #expect(OllamaServerLogParser.extractSpeed(from: "eval rate: 2.5 / 2.5 tokens per second") == 2.5)
+    }
+
     private func temporaryLog(contents: String) throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
