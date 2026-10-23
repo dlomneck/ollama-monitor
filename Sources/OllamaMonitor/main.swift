@@ -1054,13 +1054,15 @@ struct ContentView: View {
             }
 
             Divider()
-                .padding(.vertical, 14)
+                .padding(.vertical, 10)
 
             // Model
             VStack(alignment: .leading, spacing: 5) {
 
                 Text(monitor.modelName)
                     .font(.headline)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
 
                 HStack(spacing: 12) {
                     Text("Context: \(monitor.context)")
@@ -1101,10 +1103,10 @@ struct ContentView: View {
             }
 
             Divider()
-                .padding(.vertical, 14)
+                .padding(.vertical, 10)
 
             // Activity
-            VStack(alignment: .leading, spacing: 9) {
+            VStack(alignment: .leading, spacing: 7) {
                 HStack {
                     Text("ACTIVITY")
                         .font(.caption)
@@ -1155,7 +1157,7 @@ struct ContentView: View {
                 }
                 .frame(height: 24)
 
-                HStack(spacing: 24) {
+                HStack(spacing: 14) {
                     VStack(alignment: .leading, spacing: 3) {
                         Text(monitor.state == "PROCESSING" ? "PROMPT TOKENS" : "GENERATED")
                             .font(.caption2)
@@ -1223,7 +1225,7 @@ struct ContentView: View {
             )
 
             if isSystemPerformanceExpanded {
-                VStack(alignment: .leading, spacing: 9) {
+                VStack(alignment: .leading, spacing: 7) {
                     metricRow(
                         title: "CPU",
                         value: String(format: "%.0f%%", monitor.systemCPU),
@@ -1390,7 +1392,7 @@ struct ContentView: View {
             Spacer()
 
             // Footer
-            VStack(spacing: 7) {
+            VStack(spacing: 5) {
                 HStack {
                     Text("Status")
                         .font(.caption)
@@ -1427,8 +1429,8 @@ struct ContentView: View {
                 }
             }
         }
-        .padding(20)
-        .frame(width: 500)
+        .padding(16)
+        .frame(width: 420)
         .fixedSize(horizontal: false, vertical: true)
         .background(
             GeometryReader { geometry in
@@ -1550,7 +1552,7 @@ struct AboutView: View {
                 .font(.title2)
                 .bold()
 
-            Text("Version 0.26")
+            Text("Version 0.27")
                 .foregroundStyle(.secondary)
 
             Text("David Lomneck")
@@ -1671,7 +1673,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             panel = NSPanel(
                 contentRect: NSRect(
-                    x: 0, y: 0, width: 520, height: 800
+                    x: 0, y: 0, width: 420, height: 800
                 ),
                 styleMask: [.titled, .closable, .utilityWindow],
                 backing: .buffered,
@@ -1698,7 +1700,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
 
                     let oldFrame = panel.frame
-                    let newSize = NSSize(width: 500, height: height)
+                    let newSize = NSSize(width: 420, height: height)
                     let heightDelta = newSize.height - oldFrame.size.height
 
                     var newFrame = oldFrame
@@ -1791,6 +1793,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 defer: false
             )
             window.title = "About Ollama Monitor"
+            window.level = .modalPanel
             window.isReleasedWhenClosed = false
             window.contentViewController = NSHostingController(
                 rootView: AboutView()
@@ -1798,9 +1801,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             aboutWindow = window
         }
 
+        NSApp.activate(ignoringOtherApps: true)
         aboutWindow?.center()
         aboutWindow?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
     }
 
     @objc private func quitApp(_ sender: Any?) {
